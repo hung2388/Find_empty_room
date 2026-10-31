@@ -8,11 +8,11 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # Base semester start for Fall 2026 (Semester 20261)
-# 2026-09-14 is Monday of Week 1; today 2026-10-30 is Friday of Week 7.
+# 2026-09-14 is Monday of Week 1; Week 7 is 2026-10-26 to 2026-11-01.
 DEFAULT_SEMESTER_START = datetime.date(2026, 9, 14)
 
 def parse_time_range(t_str: Any) -> Optional[Tuple[int, int]]:
-    """Parses time string like 0920-1145, 1230-1410 into (start_min, end_min)."""
+    """Parses time string like 0920-1145, 09:20-11:45 into (start_min, end_min)."""
     if not t_str or str(t_str).strip().upper() in ("NULL", "NONE", ""):
         return None
     s = str(t_str).strip()
@@ -21,7 +21,6 @@ def parse_time_range(t_str: Any) -> Optional[Tuple[int, int]]:
         h1, m1 = int(m.group(1)), int(m.group(2))
         h2, m2 = int(m.group(3)), int(m.group(4))
         return (h1 * 60 + m1, h2 * 60 + m2)
-    # Check with colons / h
     m2 = re.match(r"^(\d{1,2})[:h](\d{2})\s*[-–—]\s*(\d{1,2})[:h](\d{2})$", s.lower())
     if m2:
         h1, m1 = int(m2.group(1)), int(m2.group(2))
@@ -30,10 +29,10 @@ def parse_time_range(t_str: Any) -> Optional[Tuple[int, int]]:
     return None
 
 def parse_weeks(w_str: Any) -> Set[int]:
-    """Parses week string like '2-9,11-18' into set of ints {2,3,4,...,9,11,...,18}."""
+    """Parses week string like '2-9,11-18' or '2,3,4' into set of ints."""
     if not w_str:
         return set()
-    s = str(w_str).strip().replace('"', "").replace("'", "")
+    s = str(w_str).strip().replace('"', "").replace("'", "").replace(" ", "").replace(".", ",")
     if not s or s.upper() in ("NULL", "NONE"):
         return set()
     weeks = set()
@@ -95,10 +94,17 @@ class TimetableEngine:
         self.room_classes: Dict[str, Dict[int, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
         self.invalid_rows: List[Dict[str, Any]] = []
         self.conflicts: List[Dict[str, Any]] = []
-        self.detected_encoding: str = "cp1252"
+        self.detected_encoding: str = "utf-8"
         self.total_rows: int = 0
 
     def load_file(self, file_path_or_bytes: Any, encoding_override: Optional[str] = None) -> Dict[str, Any]:
+        self.all_rooms.clear()
+        self.all_buildings.clear()
+        self.building_to_rooms.clear()
+        self.room_classes.clear()
+        self.invalid_rows.clear()
+        self.conflicts.clear()
+
         if isinstance(file_path_or_bytes, str):
             with open(file_path_or_bytes, "rb") as f:
                 raw_bytes = f.read()
@@ -109,49 +115,50 @@ class TimetableEngine:
         text = ""
         enc = encoding_override
         if not enc:
-            try:
-                text = raw_bytes.decode("utf-8")
-                enc = "utf-8"
-            except UnicodeDecodeError:
-                for cand in ["cp1252", "cp1258", "latin1"]:
-                    try:
-                        text = raw_bytes.decode(cand)
-                        enc = cand
-                        break
-                    except Exception:
-                        pass
+            for cand in ["utf-8-sig", "utf-8", "cp1252", "cp1258", "latin1"]:
+                try:
+                    text = raw_bytes.decode(cand)
+                    enc = cand
+                    break
+                except Exception:
+                    continue
         else:
             text = raw_bytes.decode(enc, errors="replace")
 
-        self.detected_encoding = enc or "cp1252"
+        self.detected_encoding = enc or "utf-8"
         reader = csv.reader(io.StringIO(text))
         rows = list(reader)
         self.total_rows = len(rows)
 
-        # Find header row
+        # Discover header row
         header_idx = -1
-        thu_col = 10
-        time_col = 11
-        week_col = 15
-        room_col = 16
-        status_col = 20
+        col_map = {}
 
-        for idx, r in enumerate(rows[:20]):
-            r_str = " ".join(r).lower()
-            if "ph" in r_str and ("th" in r_str or "tu" in r_str):
+        for idx, r in enumerate(rows[:25]):
+            # Check if this row is header
+            r_lower = [str(c).strip().lower().replace(" ", "_") for c in r]
+            if any(k in r_lower for k in ("thứ", "thu", "th?")) and any(k in r_lower for k in ("phòng", "phong", "tòa", "toa")):
                 header_idx = idx
-                # Map columns dynamically
-                for c_idx, c_val in enumerate(r):
-                    cv = c_val.strip().lower()
-                    if cv in ("th?", "thứ", "thu"): thu_col = c_idx
-                    elif "gian" in cv or "time" in cv: time_col = c_idx
-                    elif "tu" in cv or "week" in cv: week_col = c_idx
-                    elif "ph" in cv or "room" in cv: room_col = c_idx
-                    elif "tr?ng" in cv or "trạng" in cv or "status" in cv: status_col = c_idx
+                for c_i, c_val in enumerate(r):
+                    cv = str(c_val).strip().lower().replace(" ", "_")
+                    col_map[cv] = c_i
                 break
 
         if header_idx == -1:
-            header_idx = 2 # standard default for HUST export
+            header_idx = 0
+            if rows:
+                for c_i, c_val in enumerate(rows[0]):
+                    cv = str(c_val).strip().lower().replace(" ", "_")
+                    col_map[cv] = c_i
+
+        # Map essential columns
+        thu_col = col_map.get("thứ", col_map.get("thu", col_map.get("th?", 0)))
+        time_col = col_map.get("thời_gian", col_map.get("thoi_gian", col_map.get("th?i_gian", 1)))
+        week_col = col_map.get("tuần", col_map.get("tuan", col_map.get("tu?n", 5)))
+        room_col = col_map.get("phòng", col_map.get("phong", col_map.get("mã_phòng", col_map.get("phng", 8))))
+        bldg_col = col_map.get("tòa", col_map.get("toa", -1))
+        kip_col = col_map.get("kíp", col_map.get("kip", col_map.get("kp", 4)))
+        status_col = col_map.get("trạng_thái", col_map.get("trang_thai", col_map.get("tr?ng_thi", -1)))
 
         for line_no, r in enumerate(rows[header_idx + 1:], start=header_idx + 2):
             if not r or all(not str(c).strip() for c in r):
@@ -161,14 +168,19 @@ class TimetableEngine:
             raw_thu = r[thu_col].strip() if thu_col < len(r) else ""
             raw_time = r[time_col].strip() if time_col < len(r) else ""
             raw_week = r[week_col].strip() if week_col < len(r) else ""
-            status = r[status_col].strip() if status_col < len(r) else ""
+            status = r[status_col].strip() if status_col != -1 and status_col < len(r) else ""
 
-            bldg, rm_num, _ = split_room(raw_room)
+            # Check building
+            if bldg_col != -1 and bldg_col < len(r) and r[bldg_col].strip():
+                bldg = r[bldg_col].strip()
+            else:
+                bldg, _, _ = split_room(raw_room)
+
             thu = parse_thu(raw_thu)
             t_range = parse_time_range(raw_time)
             weeks = parse_weeks(raw_week)
 
-            if not bldg or not thu or not t_range or not weeks:
+            if not bldg or not thu or not t_range or not weeks or not raw_room:
                 self.invalid_rows.append({
                     "line": line_no,
                     "room": raw_room,
@@ -239,7 +251,7 @@ class TimetableEngine:
     def find_free_rooms(self, buildings: List[str], thu: int, week: int, start_min: int, end_min: int) -> List[str]:
         target_rooms = set()
         for b in buildings:
-            if b.upper() in ("ALL", "TAT_CA"):
+            if b.upper() in ("ALL", "TAT_CA", "TẤT CẢ"):
                 target_rooms.update(self.all_rooms)
             else:
                 target_rooms.update(self.building_to_rooms.get(b, set()))
